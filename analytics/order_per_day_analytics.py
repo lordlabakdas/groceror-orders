@@ -1,2 +1,2 @@
-class OrderPerDayAnalytics():
+class OrderPerDayAnalytics:
     pass
