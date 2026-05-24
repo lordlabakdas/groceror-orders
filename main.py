@@ -1,64 +1,93 @@
 import logging
-import os
+import threading
 import time
 
 import pika
+import uvicorn
 
+import config
+import metrics
 from order import Order
 
 logger = logging.getLogger(__name__)
 
 
 def setup_rabbit_connection():
-    """Establish connection to RabbitMQ"""
-    try:
-        credentials = pika.PlainCredentials(
-            os.getenv("RABBITMQ_USER", "guest"), os.getenv("RABBITMQ_PASS", "guest")
-        )
-        parameters = pika.ConnectionParameters(
-            host=os.getenv("RABBITMQ_HOST", "localhost"),
-            credentials=credentials,
-            heartbeat=600,
-            blocked_connection_timeout=300,
-        )
-        return pika.BlockingConnection(parameters)
-    except Exception as e:
-        logger.error(f"Failed to connect to RabbitMQ: {str(e)}")
-        raise
+    """Establish connection to RabbitMQ."""
+    credentials = pika.PlainCredentials(config.RABBITMQ_USER, config.RABBITMQ_PASS)
+    parameters = pika.ConnectionParameters(
+        host=config.RABBITMQ_HOST,
+        port=config.RABBITMQ_PORT,
+        virtual_host=config.RABBITMQ_VHOST,
+        credentials=credentials,
+        heartbeat=600,
+        blocked_connection_timeout=300,
+    )
+    return pika.BlockingConnection(parameters)
+
+
+def _declare_topology(channel):
+    """Declare DLX, DLQ, and main queue with dead-letter routing.
+
+    Must match the topology declared by the groceror producer so that
+    passive re-declarations succeed without argument conflicts.
+    """
+    channel.exchange_declare(exchange=config.DLX_EXCHANGE, exchange_type="direct", durable=True)
+    channel.queue_declare(queue=config.DLQ_NAME, durable=True)
+    channel.queue_bind(exchange=config.DLX_EXCHANGE, queue=config.DLQ_NAME, routing_key=config.QUEUE_NAME)
+
+    channel.queue_declare(
+        queue=config.QUEUE_NAME,
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": config.DLX_EXCHANGE,
+            "x-dead-letter-routing-key": config.QUEUE_NAME,
+        },
+    )
 
 
 def start_consumer():
-    """Start consuming messages from RabbitMQ"""
+    """Start consuming messages from RabbitMQ with reconnect loop."""
     while True:
         try:
             connection = setup_rabbit_connection()
             channel = connection.channel()
+            _declare_topology(channel)
 
-            # Declare queue with durability
-            channel.queue_declare(queue="order_queue", durable=True)
-
-            # Set up consumer
             channel.basic_qos(prefetch_count=1)
-
             channel.basic_consume(
-                queue="order_queue", on_message_callback=Order.save_order_info
+                queue=config.QUEUE_NAME, on_message_callback=Order.save_order_info
             )
 
-            print("Email service started. Waiting for messages...")
+            logger.info("groceror-orders consumer started. Waiting for messages...")
+            metrics.set_consumer_up(1)
             channel.start_consuming()
 
         except pika.exceptions.AMQPConnectionError:
             logger.error("Lost connection to RabbitMQ. Retrying in 5 seconds...")
+            metrics.set_consumer_up(0)
             time.sleep(5)
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
+        except Exception as exc:
+            logger.error("Unexpected error: %s. Retrying in 5 seconds...", exc)
+            metrics.set_consumer_up(0)
             time.sleep(5)
+
+
+def start_api():
+    """Start the FastAPI analytics server."""
+    uvicorn.run(
+        "api:app",
+        host=config.API_HOST,
+        port=config.API_PORT,
+        log_level="info",
+    )
 
 
 if __name__ == "__main__":
-    import threading
+    logging.basicConfig(level=logging.INFO)
 
-    # Start message consumer in a separate thread
-    consumer_thread = threading.Thread(target=start_consumer)
-    consumer_thread.daemon = False
+    consumer_thread = threading.Thread(target=start_consumer, daemon=True)
     consumer_thread.start()
+
+    # Analytics API runs on the main thread
+    start_api()

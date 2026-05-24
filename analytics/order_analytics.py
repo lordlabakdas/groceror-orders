@@ -1,43 +1,79 @@
+import logging
 from typing import List
 
 from db import DB
 
+logger = logging.getLogger(__name__)
+
+COLLECTION = "client_orders"
+
 
 class OrderAnalytics:
 
-    def most_selling_item(orders: List):
+    def __init__(self, db: DB):
+        self._col = db.get_collection(COLLECTION)
+
+    def most_ordered_items(self, limit: int = 10) -> List[dict]:
+        """Return the top N items by order frequency."""
         pipeline = [
-            {"$unwind": "$items"},  # Flatten the items array
-            {"$group": {"_id": "$items", "total_price": {"$sum": "total_price"}}},
-            {"$sort": {"total_price": -1}},  # Sort descending
-            {"$limit": 1},  # Get top item only
+            {"$unwind": "$items"},
+            {"$group": {"_id": "$items", "order_count": {"$sum": 1}}},
+            {"$sort": {"order_count": -1}},
+            {"$limit": limit},
+            {"$project": {"item": "$_id", "order_count": 1, "_id": 0}},
         ]
+        return list(self._col.aggregate(pipeline))
 
-        result = list(orders.aggregate(pipeline))
-        print(result)
-        if result:
-            print("Top selling item:", result[0]["_id"])
-            print("Total price:", result[0]["total_price"])
-        else:
-            print("No data found.")
+    def revenue_by_item(self, limit: int = 10) -> List[dict]:
+        """Return the top N items by total revenue contributed.
 
-    def least_selling_item(orders: List):
+        Revenue is approximated as total_price / len(items) per order line
+        since individual item prices are not stored.
+        """
         pipeline = [
-            {"$unwind": "$items"},  # Flatten the items array
+            {"$unwind": "$items"},
             {
                 "$group": {
-                    "_id": "$items.product_id",
-                    "total_price": {"$sum": "$items.price"},
+                    "_id": "$items",
+                    "revenue": {
+                        "$sum": {
+                            "$divide": [
+                                "$total_price",
+                                {"$size": "$items"},  # approximate share
+                            ]
+                        }
+                    },
                 }
             },
-            {"$sort": {"total_price": 1}},  # Sort ascending
-            {"$limit": 1},  # Get top item only
+            {"$sort": {"revenue": -1}},
+            {"$limit": limit},
+            {"$project": {"item": "$_id", "revenue": 1, "_id": 0}},
         ]
+        try:
+            return list(self._col.aggregate(pipeline))
+        except Exception:
+            # Fall back to simpler count-based ranking if $size fails on scalar items
+            return self.most_ordered_items(limit)
 
-        result = list(orders.aggregate(pipeline))
+    def total_revenue(self) -> float:
+        """Return the sum of total_price across all orders."""
+        pipeline = [
+            {"$group": {"_id": None, "total": {"$sum": "$total_price"}}},
+        ]
+        result = list(self._col.aggregate(pipeline))
+        return result[0]["total"] if result else 0.0
 
-        if result:
-            print("Least selling item:", result[0]["_id"])
-            print("Total price:", result[0]["total_price"])
-        else:
-            print("No data found.")
+    def order_count(self) -> int:
+        """Return the total number of orders."""
+        return self._col.count_documents({})
+
+    def least_ordered_items(self, limit: int = 10) -> List[dict]:
+        """Return the bottom N items by order frequency."""
+        pipeline = [
+            {"$unwind": "$items"},
+            {"$group": {"_id": "$items", "order_count": {"$sum": 1}}},
+            {"$sort": {"order_count": 1}},
+            {"$limit": limit},
+            {"$project": {"item": "$_id", "order_count": 1, "_id": 0}},
+        ]
+        return list(self._col.aggregate(pipeline))

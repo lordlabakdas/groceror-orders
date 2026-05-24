@@ -5,15 +5,12 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
-class Item(BaseModel):
-    item: str
-
-
 class Order(BaseModel):
+    schema_version: str = "1.0"
     order_id: UUID
     order_date: datetime
-    items: List[Item]
+    items: List[str]
     event: str
     total_price: float
     status: str
-    user_id: str
+    user_id: UUID
